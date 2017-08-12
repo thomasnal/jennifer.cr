@@ -72,13 +72,13 @@ module Jennifer
               exact_fields.map { |f| "#{table}.#{f}" }.join(", ", s)
             else
               s << table << ".*"
-              unless @relations.empty?
-                s << ", "
-                @relations.each_with_index do |r, i|
-                  s << ", " if i != 0
-                  s << (@table_aliases[r]? || model_class.relations[r].table_name) << ".*"
-                end
-              end
+              # unless @relations.empty?
+              #   s << ", "
+              #   @relations.each_with_index do |r, i|
+              #     s << ", " if i != 0
+              #     s << (@table_aliases[r]? || model_class.relations[r].table_name) << ".*"
+              #   end
+              # end
             end
           else
             s << @raw_select
