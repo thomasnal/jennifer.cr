@@ -1,6 +1,7 @@
 require "mysql"
 require "./base"
 require "./request_methods"
+require "./mysql/sql_notation"
 
 module Jennifer
   alias DBAny = DB::Any | Int16 | Int8 | JSON::Any
@@ -8,69 +9,75 @@ module Jennifer
   module Adapter
     alias EnumType = String
 
+    TYPE_TRANSLATIONS = {
+      :bool => "bool",
+      :enum => "enum",
+
+      :bigint  => "bigint",   # Int64
+      :integer => "int",      # Int32
+      :short   => "SMALLINT", # Int16
+      :tinyint => "TINYINT",  # Int8
+
+      :float  => "float",  # Float32
+      :double => "double", # Float64
+
+      :decimal => "decimal", # Float64
+
+      :string     => "varchar",
+      :text       => "text",
+      :var_string => "varstring",
+
+      :timestamp => "datetime", # "timestamp",
+      :date_time => "datetime",
+
+      :blob => "blob",
+      :json => "json",
+
+    }
+
+    DEFAULT_SIZES = {
+      :string => 254,
+    }
+
     class Mysql < Base
       include RequestMethods
 
-      TYPE_TRANSLATIONS = {
-        :integer    => "int",
-        :string     => "varchar",
-        :bool       => "bool",
-        :text       => "text",
-        :float      => "float",
-        :double     => "double",
-        :short      => "SMALLINT",
-        :timestamp  => "timestamp",
-        :date_time  => "datetime",
-        :blob       => "blob",
-        :var_string => "varstring",
-        :json       => "json",
-        :enum       => "enum",
-      }
-
-      DEFAULT_SIZES = {
-        :string => 254,
-      }
-
       def translate_type(name : Symbol)
-        TYPE_TRANSLATIONS[name]
+        Adapter::TYPE_TRANSLATIONS[name]
       rescue e : KeyError
         raise BaseException.new("Unknown data alias #{name}")
       end
 
       def default_type_size(name)
-        DEFAULT_SIZES[name]?
+        Adapter::DEFAULT_SIZES[name]?
+      end
+
+      def table_column_count(table)
+        Query["information_schema.COLUMNS"].where do
+          (_table_name == table) & (_table_schema == Config.db)
+        end.count
       end
 
       def table_exists?(table)
-        v = scalar <<-SQL
-          SELECT COUNT(*)
-          FROM information_schema.TABLES
-          WHERE TABLE_SCHEMA = '#{Config.db}' 
-          AND TABLE_NAME = '#{table}'
-        SQL
-        v == 1
+        Query["information_schema.TABLES"]
+          .where { (_table_schema == Config.db) & (_table_name == table) }
+          .exists?
       end
 
       def index_exists?(table, name)
-        v = scalar <<-SQL
-          SELECT COUNT(*)
-          from information_schema.statistics
-          WHERE  table_name = '#{table}' 
-          AND index_name = '#{name}'
-          AND TABLE_SCHEMA = '#{Config.db}'
-        SQL
-        v == 1
+        Query["information_schema.statistics"].where do
+          (_table_name == table) &
+            (_index_name == name) &
+            (_table_schema == Config.db)
+        end.exists?
       end
 
       def column_exists?(table, name)
-        v = scalar <<-SQL
-          SELECT COUNT(*)
-          FROM information_schema.COLUMNS
-          WHERE TABLE_NAME = '#{table}'
-          AND COLUMN_NAME = '#{name}'
-          AND TABLE_SCHEMA = '#{Config.db}'
-        SQL
-        v == 1
+        Query["information_schema.COLUMNS"].where do
+          (_table_name == table) &
+            (_column_name == name) &
+            (_table_schema == Config.db)
+        end.exists?
       end
 
       def table_row_hash(rs)

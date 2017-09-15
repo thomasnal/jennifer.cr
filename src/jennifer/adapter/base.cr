@@ -1,8 +1,10 @@
 require "db"
+require "./shared/*"
 
 module Jennifer
   module Adapter
     abstract class Base
+      TICKS_PER_MICROSECOND = 10
       @db : DB::Database
       @transaction : DB::Transaction? = nil
       @locks = {} of UInt64 => DB::Transaction
@@ -15,11 +17,11 @@ module Jennifer
 
       def self.build
         a = new
-        a.prepare
         a
       end
 
       def prepare
+        ::Jennifer::Model::Base.models.each(&.actual_table_field_count)
       end
 
       def with_connection(&block)
@@ -47,7 +49,7 @@ module Jennifer
           conn = @db.checkout
           res = yield conn
           conn.release
-          res
+          res ? res : false
         end
       end
 
@@ -63,35 +65,56 @@ module Jennifer
         @locks[Fiber.current.object_id]?
       end
 
+      def under_transaction?
+        @locks.has_key?(Fiber.current.object_id)
+      end
+
       def exec(_query, args = [] of DB::Any)
-        Config.logger.debug { regular_query_message(_query, args) }
-        with_connection { |conn| conn.exec(_query, args) }
+        time = Time.now.ticks
+        res = with_connection { |conn| conn.exec(_query, args) }
+        time = Time.now.ticks - time
+        Config.logger.debug { regular_query_message(time / TICKS_PER_MICROSECOND, _query, args) }
+        res
+      rescue e : BaseException
+        raise e
       rescue e : Exception
         raise BadQuery.new(e.message, regular_query_message(_query, args))
       end
 
       def query(_query, args = [] of DB::Any)
-        Config.logger.debug { regular_query_message(_query, args) }
-        with_connection { |conn| conn.query(_query, args) { |rs| yield rs } }
+        time = Time.now.ticks
+        res = with_connection { |conn| conn.query(_query, args) { |rs| time = Time.now.ticks - time; yield rs } }
+        Config.logger.debug { regular_query_message(time / TICKS_PER_MICROSECOND, _query, args) }
+        res
+      rescue e : BaseException
+        raise e
       rescue e : Exception
         raise BadQuery.new(e.message, regular_query_message(_query, args))
       end
 
       def scalar(_query, args = [] of DB::Any)
-        Config.logger.debug { regular_query_message(_query, args) }
-        with_connection { |conn| conn.scalar(_query, args) }
+        time = Time.now.ticks
+        res = with_connection { |conn|
+          conn.scalar(_query, args)
+        }
+        time = Time.now.ticks - time
+        Config.logger.debug { regular_query_message(time / TICKS_PER_MICROSECOND, _query, args) }
+        res
+      rescue e : BaseException
+        raise e
       rescue e : Exception
         raise BadQuery.new(e.message, regular_query_message(_query, args))
       end
 
       def transaction(&block)
         previous_transaction = current_transaction
+        res = nil
         with_transactionable do |conn|
           conn.transaction do |tx|
             lock_connection(tx)
             begin
               Config.logger.debug("TRANSACTION START")
-              yield(tx)
+              res = yield(tx)
               Config.logger.debug("TRANSACTION COMMIT")
             rescue e
               Config.logger.debug("TRANSACTION ROLLBACK")
@@ -101,6 +124,15 @@ module Jennifer
             end
           end
         end
+        res
+      end
+
+      def parse_query(q, args)
+        SqlGenerator.parse_query(q, args.size)
+      end
+
+      def parse_query(q)
+        SqlGenerator.parse_query(q)
       end
 
       def begin_transaction
@@ -128,31 +160,18 @@ module Jennifer
       end
 
       def delete(query : QueryBuilder::Query)
-        body = String.build do |s|
-          query.from_clause(s)
-          s << query.body_section
-        end
         args = query.select_args
-        exec "DELETE #{parse_query(body, args)}", args
+        exec SqlGenerator.delete(query), args
       end
 
       def exists?(query)
         args = query.select_args
-        body = String.build do |s|
-          s << "SELECT EXISTS(SELECT 1 "
-          query.from_clause(s)
-          s << parse_query(query.body_section, args) << ")"
-        end
-        scalar(body, args) == 1
+        scalar(SqlGenerator.exists(query), args) == 1
       end
 
       def count(query)
-        body = String.build do |s|
-          query.from_clause(s)
-          s << query.body_section
-        end
         args = query.select_args
-        scalar("SELECT COUNT(*) #{parse_query(body, args)}", args).as(Int64).to_i
+        scalar(SqlGenerator.count(query), args).as(Int64).to_i
       end
 
       def self.db_connection
@@ -171,15 +190,16 @@ module Jennifer
       def self.connection_string(*options)
         auth_part = Config.user
         auth_part += ":#{Config.password}" if Config.password && !Config.password.empty?
-        str = "#{Config.adapter}://#{auth_part}@#{Config.host}"
-        str += "/" + Config.db if options.includes?(:db)
-        str += "?"
-        str += [
-          {% for arg in [:max_pool_size, :initial_pool_size, :max_idle_pool_size, :retry_attempts, :checkout_timeout, :retry_delay] %}
-            "{{arg.id}}=#{Config.{{arg.id}}}"
-          {% end %},
-        ].join(",")
-        str
+        String.build do |s|
+          s << Config.adapter << "://" << auth_part << "@" << Config.host
+          s << "/" << Config.db if options.includes?(:db)
+          s << "?"
+          [
+            {% for arg in [:max_pool_size, :initial_pool_size, :max_idle_pool_size, :retry_attempts, :checkout_timeout, :retry_delay] %}
+              "{{arg.id}}=#{Config.{{arg.id}}}"
+            {% end %},
+          ].join(",", s)
+        end
       end
 
       def self.extract_arguments(hash)
@@ -194,11 +214,9 @@ module Jennifer
 
       def result_to_array(rs)
         a = [] of DBAny
-        rs.columns.each do |col|
+        rs.each_column do
           temp = rs.read(DBAny)
-          if temp.is_a?(Int8)
-            temp = (temp == 1i8).as(Bool)
-          end
+          temp = (temp == 1i8).as(Bool) if temp.is_a?(Int8)
           a << temp
         end
         a
@@ -208,12 +226,11 @@ module Jennifer
         buf = {} of String => DBAny
         names.each { |n| buf[n] = nil }
         count = names.size
-        rs.column_count.times do |col|
-          col_name = rs.column_name(col)
-          if buf.has_key?(col_name)
-            buf[col_name] = rs.read.as(DBAny)
-            if buf[col_name].is_a?(Int8)
-              buf[col_name] = (buf[col_name] == 1i8).as(Bool)
+        rs.each_column do |column|
+          if buf.has_key?(column)
+            buf[column] = rs.read.as(DBAny)
+            if buf[column].is_a?(Int8)
+              buf[column] = (buf[column] == 1i8).as(Bool)
             end
             count -= 1
           else
@@ -227,11 +244,10 @@ module Jennifer
       # converts single ResultSet to hash
       def result_to_hash(rs)
         h = {} of String => DBAny
-        rs.column_count.times do |col|
-          col_name = rs.column_name(col)
-          h[col_name] = rs.read.as(DBAny)
-          if h[col_name].is_a?(Int8)
-            h[col_name] = (h[col_name] == 1i8).as(Bool)
+        rs.each_column do |column|
+          h[column] = rs.read.as(DBAny)
+          if h[column].is_a?(Int8)
+            h[column] = (h[column] == 1i8).as(Bool)
           end
         end
         h
@@ -250,33 +266,12 @@ module Jennifer
         h
       end
 
-      def parse_query(query, args)
-        arr = [] of String
-        args.each do
-          arr << "?"
-        end
-        query % arr
-      end
-
-      def parse_query(query)
-        query
-      end
-
       def self.arg_replacement(arr)
         escape_string(arr.size)
       end
 
       def self.escape_string(size = 1)
-        case size
-        when 1
-          "%s"
-        when 2
-          "%s, %s"
-        when 3
-          "%s, %s, %s"
-        else
-          size.times.map { "%s" }.join(", ")
-        end
+        SqlGenerator.escape_string(size)
       end
 
       def self.drop_database
@@ -416,6 +411,9 @@ module Jennifer
       abstract def column_exists?(table, name)
       abstract def translate_type(name)
       abstract def default_type_size(name)
+      abstract def table_column_count(table)
+
+      # private ===========================
 
       private def column_definition(name, options, io)
         type = options[:serial]? ? "serial" : (options[:sql_type]? || translate_type(options[:type].as(Symbol)))
@@ -442,11 +440,19 @@ module Jennifer
         io << " AUTO_INCREMENT" if options[:auto_increment]?
       end
 
-      private def regular_query_message(query, args : Array)
+      private def regular_query_message(ms, query : String, args : Array)
+        args.empty? ? "#{ms} µs #{query}" : "#{ms} µs #{query} | #{args.inspect}"
+      end
+
+      private def regular_query_message(query : String, args : Array)
         args.empty? ? query : "#{query} | #{args.inspect}"
       end
 
-      private def regular_query_message(query, arg = nil)
+      private def regular_query_message(ms, query : String, arg = nil)
+        arg ? "#{ms} µs #{query} | #{arg}" : "#{ms} µs #{query}"
+      end
+
+      private def regular_query_message(query : String, arg = nil)
         arg ? "#{query} | #{arg}" : query
       end
     end

@@ -2,7 +2,18 @@ require "./*"
 
 module Jennifer
   module QueryBuilder
-    class ModelQuery(T) < Query
+    abstract class IModelQuery < Query
+      abstract def model_class
+      abstract def with(arr)
+    end
+
+    class ModelQuery(T) < IModelQuery
+      @preload_relations = [] of String
+
+      def initialize(*opts)
+        super
+      end
+
       def model_class
         T
       end
@@ -12,7 +23,11 @@ module Jennifer
       end
 
       def with(*arr)
-        arr.map(&.to_s).to_a.each do |name|
+        self.with(arr.to_a.map(&.to_s))
+      end
+
+      def with(arr : Array)
+        arr.each do |name|
           table_name = T.relation(name).table_name
           temp_joins = @joins.select { |j| j.table == table_name }
           join = temp_joins.find(&.relation.nil?)
@@ -26,7 +41,22 @@ module Jennifer
         self
       end
 
-      def relation(name, type = :inner)
+      def preload(relation : Symbol | String)
+        @preload_relations << relation.to_s
+        self
+      end
+
+      def preload(relations : Array)
+        relations.each { |rel| @preload_relations << rel.to_s }
+        self
+      end
+
+      def preload(*relations)
+        relations.each { |rel| @preload_relations << rel.to_s }
+        self
+      end
+
+      def relation(name, type = :left)
         T.relation(name.to_s).join_condition(self, type)
       end
 
@@ -51,53 +81,65 @@ module Jennifer
         to_a.each(&.destroy)
       end
 
-      # TODO: debug case when exception was rised under #each
       def to_a
         add_aliases if @relation_used
-        return to_a_with_relations if @relations.size > 0
+        return [] of T if @do_nothing
+        return to_a_with_relations unless @relations.empty?
         result = [] of T
         ::Jennifer::Adapter.adapter.select(self) do |rs|
           rs.each do
-            result << T.build(rs)
-          end
-        end
-        result
-      end
-
-      def select_clause(exact_fields = [] of String)
-        String.build do |s|
-          s << "SELECT "
-          unless @raw_select
-            if exact_fields.size > 0
-              exact_fields.map { |f| "#{table}.#{f}" }.join(", ", s)
-            else
-              s << table << ".*"
-              unless @relations.empty?
-                s << ", "
-                @relations.each_with_index do |r, i|
-                  s << ", " if i != 0
-                  s << (@table_aliases[r]? || model_class.relations[r].table_name) << ".*"
-                end
-              end
+            begin
+              result << T.build(rs)
+            ensure
+              rs.read_to_end
             end
-          else
-            s << @raw_select
           end
-          s << "\n"
-          from_clause(s)
         end
+        add_preloaded(result)
       end
 
       # ========= private ==============
 
       private def reverse_order
         if @order.empty?
-          @order[T.primary_field_name] = "DESC"
+          # TODO: make smth like T.primary_field.to_s
+          @order["#{T.table_name}.#{T.primary_field_name}"] = "DESC"
         else
           super
         end
       end
 
+      # Loads relations added by `preload` method; makes one separate request per each relation
+      private def add_preloaded(collection)
+        return collection if collection.empty?
+        primary_fields = [] of DBAny
+        last_primary_field_name = ""
+
+        @preload_relations.each do |name|
+          rel = T.relation(name)
+          _primary = rel.primary_field
+          _foreign = rel.foreign_field
+
+          if last_primary_field_name != _primary
+            last_primary_field_name = _primary
+            primary_fields.clear
+            collection.each { |e| primary_fields << e.attribute(_primary) }
+          end
+
+          new_collection = rel.query(primary_fields).db_results
+
+          unless new_collection.empty?
+            collection.each_with_index do |mod, i|
+              pv = primary_fields[i]
+              # TODO: check if deleting elements from array will increase performance
+              new_collection.each { |hash| mod.append_relation(name, hash) if hash[_foreign] == pv }
+            end
+          end
+        end
+        collection
+      end
+
+      # TODO: brake this method to smaller ones
       private def to_a_with_relations
         h_result = {} of String => T
 
@@ -105,29 +147,33 @@ module Jennifer
         existence = @relations.map { |_| {} of String => Bool }
         ::Jennifer::Adapter.adapter.select(self) do |rs|
           rs.each do
-            h = build_hash(rs, T.field_count)
-            main_field = T.primary_field_name
-            if h[main_field]?
-              obj = (h_result[h[main_field].to_s] ||= T.build(h, false))
-              models.each_with_index do |model, i|
-                h = build_hash(rs, model.field_count)
-                pfn = model.primary_field_name
-                if h[pfn].nil? || existence[i][h[pfn].to_s]?
-                  (rs.column_count - rs.column_index).times do |i|
-                    rs.read
+            begin
+              h = build_hash(rs, T.actual_table_field_count)
+              main_field = T.primary_field_name
+              if h[main_field]?
+                obj = (h_result[h[main_field].to_s] ||= T.build(h, false))
+                models.each_with_index do |model, i|
+                  h = build_hash(rs, model.actual_table_field_count)
+                  pfn = model.primary_field_name
+                  if h[pfn].nil? || existence[i][h[pfn].to_s]?
+                    (rs.column_count - rs.column_index).times do |i|
+                      rs.read
+                    end
+                    break
+                  else
+                    existence[i][h[pfn].to_s] = true
+                    obj.append_relation(@relations[i], h)
                   end
-                  break
-                else
-                  existence[i][h[pfn].to_s] = true
-                  obj.append_relation(@relations[i], h)
                 end
+              else
+                (rs.column_count - T.actual_table_field_count).times { |_| rs.read }
               end
-            else
-              (rs.column_count - T.field_count).times { |_| rs.read }
+            ensure
+              rs.read_to_end
             end
           end
         end
-        h_result.values
+        add_preloaded(h_result.values)
       end
 
       private def add_aliases

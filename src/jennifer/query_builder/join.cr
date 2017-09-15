@@ -2,16 +2,16 @@ module Jennifer
   module QueryBuilder
     class Join
       @type : Symbol
-      property table : String, :type, on : Condition | LogicOperator, aliass : String?, relation : String?
-
-      def initialize(@table, @on, @type, @aliass = nil, @relation = nil)
-      end
+      property table : String, type, on : Condition | LogicOperator, aliass : String?, relation : String?
 
       def initialize(@table, on : Criteria, @type, @aliass = nil, @relation = nil)
-        @on = Condition.new(on)
+        @on = on.to_condition
       end
 
-      def to_sql
+      def initialize(@table, @on : Condition | LogicOperator, @type, @aliass = nil, @relation = nil)
+      end
+
+      def as_sql
         sql_string =
           case @type
           when :left
@@ -21,12 +21,11 @@ module Jennifer
           else
             "JOIN "
           end
-        sql_string +
-          if @aliass
-            "#{@table} #{@aliass} ON #{@on.to_sql}\n"
-          else
-            "#{@table} ON #{@on.to_sql}\n"
-          end
+        sql_string + "#{table_name} ON #{@on.as_sql}\n"
+      end
+
+      def table_name
+        @aliass ? "#{@table} #{@aliass}" : @table
       end
 
       def alias_tables(aliases)
@@ -36,6 +35,10 @@ module Jennifer
 
       def sql_args
         @on.sql_args
+      end
+
+      def sql_args_count
+        @on.sql_args_count
       end
     end
   end

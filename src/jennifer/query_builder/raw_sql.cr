@@ -10,12 +10,16 @@ module Jennifer
 
       def alias_tables(aliases); end
 
-      def to_sql
+      def as_sql
         "(" + @field + ")"
       end
 
       def sql_args
         @params
+      end
+
+      def sql_args_count
+        @params.size
       end
     end
   end

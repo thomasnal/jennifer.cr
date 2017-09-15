@@ -37,6 +37,24 @@ module Jennifer
         {% end %}
       end
 
+      macro after_destroy(*names)
+        {% for name in names %}
+          {% AFTER_DESTROY_CALLBACKS << name.id.stringify %}
+        {% end %}
+      end
+
+      macro before_validation(*names)
+        {% for name in names %}
+          {% BEFORE_VALIDATION_CALLBACKS << name.id.stringify %}
+        {% end %}
+      end
+
+      macro after_validation(*names)
+        {% for name in names %}
+          {% AFTER_VALIDATION_CALLBACKS << name.id.stringify %}
+        {% end %}
+      end
+
       macro inherited_hook
         BEFORE_SAVE_CALLBACKS = [] of String
         AFTER_SAVE_CALLBACKS = [] of String
@@ -44,6 +62,9 @@ module Jennifer
         AFTER_CREATE_CALLBACKS = [] of String
         AFTER_INITIALIZE_CALLBACKS = [] of String
         BEFORE_DESTROY_CALLBACKS = [] of String
+        AFTER_DESTROY_CALLBACKS = [] of String
+        BEFORE_VALIDATION_CALLBACKS = [] of String
+        AFTER_VALIDATION_CALLBACKS = [] of String
       end
 
       macro finished_hook
@@ -51,36 +72,71 @@ module Jennifer
           \{% for method in BEFORE_SAVE_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+          true
+        rescue ::Jennifer::Skip
+          false
         end
 
         def __after_save_callback
           \{% for method in AFTER_SAVE_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+        rescue ::Jennifer::Skip
         end
 
         def __before_create_callback
           \{% for method in BEFORE_CREATE_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+          true
+        rescue ::Jennifer::Skip
+          false
         end
 
         def __after_create_callback
           \{% for method in AFTER_CREATE_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+        rescue ::Jennifer::Skip
         end
 
         def __after_initialize_callback
           \{% for method in AFTER_INITIALIZE_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+        rescue ::Jennifer::Skip
         end
 
         def __before_destroy_callback
           \{% for method in BEFORE_DESTROY_CALLBACKS %}
             \{{method.id}}
           \{% end %}
+          true
+        rescue ::Jennifer::Skip
+          false
+        end
+
+        def __after_destroy_callback
+          \{% for method in AFTER_DESTROY_CALLBACKS %}
+            \{{method.id}}
+          \{% end %}
+        rescue ::Jennifer::Skip
+        end
+
+        def __before_validation_callback
+          \{% for method in BEFORE_VALIDATION_CALLBACKS %}
+            \{{method.id}}
+          \{% end %}
+          true
+        rescue ::Jennifer::Skip
+          false
+        end
+
+        def __after_validation_callback
+          \{% for method in AFTER_VALIDATION_CALLBACKS %}
+            \{{method.id}}
+          \{% end %}
+        rescue ::Jennifer::Skip
         end
       end
     end

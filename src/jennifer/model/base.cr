@@ -1,21 +1,38 @@
 require "./mapping"
+require "./sti_mapping"
 require "./validation"
 require "./callback"
 require "./relation_definition"
+require "./scoping"
 
 module Jennifer
   module Model
     abstract class Base
-      include Support
+      extend Ifrit
       include Mapping
+      include STIMapping
       include Validation
       include Callback
       include RelationDefinition
+      include Scoping
 
       alias Supportable = DBAny | Base
 
+      MODELS = [] of String
+
       @@table_name : String?
       @@singular_table_name : String?
+      @@actual_table_field_count : Int32?
+      @@has_table : Bool?
+
+      def self.has_table?
+        @@has_table ||= Jennifer::Adapter.adapter.table_exists?(table_name).as(Bool)
+      end
+
+      # Represent actual amount of model's table column amount (is greped from db).
+      def self.actual_table_field_count
+        @@actual_table_field_count ||= ::Jennifer::Adapter.adapter.table_column_count(table_name)
+      end
 
       def self.table_name(value : String | Symbol)
         @@table_name = value.to_s
@@ -63,9 +80,44 @@ module Jennifer
         o
       end
 
+      # TODO: not always constructor without arguments could be generated
+      # this should be moved to mapping.cr
       def self.build
         o = new
         o.__after_initialize_callback
+        o
+      end
+
+      def new_record?
+        @new_record
+      end
+
+      def destroyed?
+        @destroyed
+      end
+
+      def self.create(values : Hash | NamedTuple)
+        o = build(values)
+        o.save
+        o
+      end
+
+      def self.create
+        a = {} of String => DBAny
+        o = build(a)
+        o.save
+        o
+      end
+
+      def self.create!(values : Hash | NamedTuple)
+        o = build(values)
+        o.save!
+        o
+      end
+
+      def self.create!
+        o = build({} of Symbol => Supportable)
+        o.save!
         o
       end
 
@@ -76,28 +128,6 @@ module Jennifer
       abstract def primary
       abstract def attribute(name)
       abstract def set_attribute(name, value)
-
-      macro scope(name, &block)
-        class Jennifer::QueryBuilder::ModelQuery(T)
-          def {{name.id}}({{ block.args.join(", ").id }})
-            T.{{name.id}}(self, {{block.args.join(", ").id}})
-          end
-        end
-
-        def self.{{name.id}}({{ block.args.map(&.stringify).map { |e| "__" + e }.join(", ").id }})
-          {% if !block.args.empty? %}
-            {{ block.args.map(&.stringify).join(", ").id }} = {{block.args.map(&.stringify).map { |e| "__" + e }.join(", ").id}}
-          {% end %}
-          all.exec { {{block.body}} }
-        end
-
-        def self.{{name.id}}(_query : ::Jennifer::QueryBuilder::ModelQuery({{@type}}){% if !block.args.empty? %}, {{ block.args.map(&.stringify).map { |e| "__" + e }.join(", ").id }} {% end %})
-          {% if !block.args.empty? %}
-            {{ block.args.map(&.stringify).join(", ").id }} = {{block.args.map(&.stringify).map { |e| "__" + e }.join(", ").id}}
-          {% end %}
-          _query.exec { {{block.body}} }
-        end
-      end
 
       macro def self.models
         {% begin %}
@@ -114,10 +144,10 @@ module Jennifer
         ::Jennifer::Model::Callback.inherited_hook
         ::Jennifer::Model::RelationDefinition.inherited_hook
 
-
         @@relations = {} of String => ::Jennifer::Relation::IRelation
 
         after_save :__refresh_changes
+        before_save :__check_if_changed
 
         def self.table_name : String
           @@table_name ||= {{@type}}.to_s.underscore.pluralize
@@ -143,7 +173,7 @@ module Jennifer
           def self.relation(name : String)
             @@relations[name]
           rescue e : KeyError
-            raise Jennifer::UnknownRelation.new(self, /"(?<r>.*)"$/.match(e.message.to_s).try &.["r"])
+            raise Jennifer::UnknownRelation.new(self, e)
           end
         end
       end
@@ -152,16 +182,50 @@ module Jennifer
         hash.each { |k, v| set_attribute(k, v) }
       end
 
+      # Deletes object from db and calls callbacks
       def destroy
-        return if new_record?
-        __before_destroy_callback
-        delete
+        unless ::Jennifer::Adapter.adapter.under_transaction?
+          {{@type}}.transaction do
+            destroy_without_transaction
+          end
+        else
+          destroy_without_transaction
+        end
       end
 
+      def destroy_without_transaction
+        return false if new_record? || !__before_destroy_callback
+        @destroyed = true if delete
+        __after_destroy_callback if @destroyed
+        @destroyed
+      end
+
+      # Deletes object from DB without calling callbacks
       def delete
-        return if new_record?
+        return if new_record? || errors.any?
         this = self
-        self.class.where { this.class.primary == this.primary }.delete
+        self.class.all.where { this.class.primary == this.primary }.delete
+      end
+
+      # Lock current object in DB
+      def lock!(type : String | Bool = true)
+        this = self
+        self.class.all.where { this.class.primary == this.primary }.lock(type).to_a
+      end
+
+      # Starts transaction and locks current object
+      def with_lock(type : String | Bool = true)
+        self.class.transaction do |t|
+          self.lock!(type)
+          yield(t)
+        end
+      end
+
+      # Starts transaction
+      def self.transaction
+        Adapter.adapter.transaction do |t|
+          yield(t)
+        end
       end
 
       def self.where(&block)
@@ -174,13 +238,13 @@ module Jennifer
       def self.find(id)
         _id = id
         this = self
-        where { this.primary == _id }.first
+        all.where { this.primary == _id }.first
       end
 
       def self.find!(id)
         _id = id
         this = self
-        where { this.primary == _id }.first!
+        all.where { this.primary == _id }.first!
       end
 
       def self.all
@@ -193,7 +257,7 @@ module Jennifer
 
       def self.destroy(ids : Array)
         _ids = ids
-        where do
+        all.where do
           if _ids.size == 1
             c(primary_field_name) == _ids[0]
           else
@@ -208,7 +272,7 @@ module Jennifer
 
       def self.delete(ids : Array)
         _ids = ids
-        where do
+        all.where do
           if _ids.size == 1
             c(primary_field_name) == _ids[0]
           else

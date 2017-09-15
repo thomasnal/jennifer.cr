@@ -1,6 +1,7 @@
 require "pg"
 require "../adapter"
 require "./request_methods"
+require "./postgres/sql_notation"
 
 module Jennifer
   alias DBAny = Array(Int32) | Array(Char) | Array(Float32) | Array(Float64) |
@@ -12,29 +13,55 @@ module Jennifer
   module Adapter
     alias EnumType = Bytes
 
+    TYPE_TRANSLATIONS = {
+      :integer => "int",      # Int32
+      :short   => "SMALLINT", # Int16
+      :bigint  => "BIGINT",   # Int64
+      :oid     => "oid",      # UInt32
+
+      :float  => "real",             # Float32
+      :double => "double precision", # Float64
+
+      :numeric => "numeric", # PG::Numeric
+      :decimal => "decimal", # PG::Numeric - is alias for numeric
+
+      :string     => "varchar",
+      :char       => "char",
+      :bool       => "boolean",
+      :text       => "text",
+      :var_string => "varchar",
+      :varchar    => "varchar",
+      :blchar     => "blchar", # String
+
+      :uuid => "uuid", # String
+
+      :timestamp   => "timestamp",
+      :timestamptz => "timestamptz", # Time
+      :date_time   => "datetime",
+
+      :blob  => "blob",
+      :bytea => "bytea",
+
+      :json  => "json",  # JSON
+      :jsonb => "jsonb", # JSON
+      :xml   => "xml",   # String
+
+      :point   => "point",
+      :lseg    => "lseg",
+      :path    => "path",
+      :box     => "box",
+      :polygon => "polygon",
+      :line    => "line",
+      :circle  => "circle",
+    }
+
+    DEFAULT_SIZES = {
+      :string     => 254,
+      :var_string => 254,
+    }
+
     class Postgres < Base
       include RequestMethods
-
-      TYPE_TRANSLATIONS = {
-        :integer    => "int",
-        :string     => "varchar",
-        :char       => "char",
-        :bool       => "boolean",
-        :text       => "text",
-        :float      => "real",
-        :double     => "double precision",
-        :short      => "SMALLINT",
-        :timestamp  => "timestamp",
-        :date_time  => "datetime",
-        :blob       => "blob",
-        :var_string => "varchar",
-        :json       => "json",
-      }
-
-      DEFAULT_SIZES = {
-        :string     => 254,
-        :var_string => 254,
-      }
 
       def prepare
         _query = <<-SQL
@@ -48,72 +75,73 @@ module Jennifer
             PG::Decoders.register_decoder PG::Decoders::StringDecoder.new, rs.read(UInt32).to_i
           end
         end
+        super
       end
 
       def translate_type(name)
-        TYPE_TRANSLATIONS[name]
+        Adapter::TYPE_TRANSLATIONS[name]
       rescue e : KeyError
         raise BaseException.new("Unknown data alias #{name}")
       end
 
       def default_type_size(name)
-        DEFAULT_SIZES[name]?
+        Adapter::DEFAULT_SIZES[name]?
       end
 
-      def parse_query(query, args)
-        arr = [] of String
-        i = 0
-        args.each do
-          i += 1
-          arr << "$#{i}"
+      def refresh_materialized_view(name)
+        exec <<-SQL
+          REFRESH MATERIALIZED VIEW #{name}
+        SQL
+      end
+
+      def table_column_count(table)
+        if table_exists?(table)
+          Query["information_schema.columns"].where { _table_name == table }.count
+        elsif material_view_exists?(table)
+          # materialized view
+          Query["pg_attribute"]
+            .join("pg_class") { _pg_attribute__attrelid == _oid }
+            .join("pg_namespace") { _oid == _pg_class__relnamespace }
+            .where do
+            (_attnum > 0) &
+              (_pg_namespace__nspname == Config.schema) &
+              (_pg_class__relname == table) &
+              _attisdropped.not
+          end.count
+        else
+          -1
         end
-        query % arr
       end
 
-      def parse_query(q)
-        q
+      def material_view_exists?(name)
+        Query["pg_class"].join("pg_namespace") { _oid == _pg_class__relnamespace }.where do
+          (_relkind == "m") &
+            (_pg_namespace__nspname == Config.schema) &
+            (_relname == name)
+        end.exists?
       end
 
       def table_exists?(table)
-        scalar <<-SQL
-          SELECT EXISTS (
-            SELECT 1
-            FROM   information_schema.tables
-            WHERE  table_name = '#{table}'
-          )
-          SQL
+        Query["information_schema.tables"]
+          .where { _table_name == table }
+          .exists?
       end
 
       def column_exists?(table, name)
-        scalar <<-SQL
-          SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_name='#{table}' and column_name='#{name}'
-          )
-        SQL
+        Query["information_schema.columns"]
+          .where { (_table_name == table) & (_column_name == name) }
+          .exists?
       end
 
       def index_exists?(table, name)
-        scalar <<-SQL
-          SELECT EXISTS (
-            SELECT 1
-            FROM   pg_class c
-            JOIN   pg_namespace n ON n.oid = c.relnamespace
-            WHERE  c.relname = '#{name}'
-            AND    n.nspname = '#{Config.schema}'
-          )
-        SQL
+        Query["pg_class"]
+          .join("pg_namespace") { _oid == _pg_class__relnamespace }
+          .where { (_pg_class__relname == name) & (_pg_namespace__nspname == Config.schema) }
+          .exists?
       end
 
       def data_type_exists?(name)
-        scalar <<-SQL
-          EXISTS ( 
-            SELECT 1
-            FROM pg_type
-            WHERE typname = '#{name}'
-          )
-        SQL
+        Query["pg_type"].where { _typname == name }.exists?
       end
 
       def enum_values(name)
@@ -211,29 +239,27 @@ module Jennifer
 
       def insert(obj : Model::Base)
         opts = obj.arguments_to_insert
-        query = String.build do |s|
-          s << "INSERT INTO " << obj.class.table_name << "("
-          opts[:fields].join(", ", s)
-          s << ") values (" << self.class.escape_string(opts[:fields].size) << ")"
-        end
+        query = parse_query(SqlGenerator.insert(obj, obj.class.primary_auto_incrementable?), opts[:args])
         id = -1i64
         affected = 0i64
-        transaction do
-          affected = exec(parse_query(query, opts[:args]), opts[:args]).rows_affected
-          if affected > 0 && obj.class.primary_auto_incrementable?
+        if obj.class.primary_auto_incrementable?
+          # TODO: move this back when pg driver will raise exception when inserted record brake some constraint
+          # id = scalar(query, opts[:args]).as(Int32).to_i64
+          # affected += 1 if id > 0
+          affected = exec(query, opts[:args]).rows_affected
+          if affected != 0
             id = scalar("SELECT currval(pg_get_serial_sequence('#{obj.class.table_name}', '#{obj.class.primary_field_name}'))").as(Int64)
           end
+        else
+          affected = exec(query, opts[:args]).rows_affected
         end
+
         ExecResult.new(id, affected)
       end
 
       def exists?(query)
         args = query.select_args
-        body = String.build do |s|
-          s << "SELECT EXISTS(SELECT 1 "
-          query.from_clause(s)
-          s << parse_query(query.body_section, args) << ")"
-        end
+        body = SqlGenerator.exists(query)
         scalar(body, args)
       end
 
@@ -252,7 +278,11 @@ module Jennifer
       end
 
       private def column_type_definition(options, io)
-        type = options[:serial]? || options[:auto_increment]? ? "serial" : options[:sql_type]? || translate_type(options[:type].as(Symbol))
+        type = if options[:serial]? || options[:auto_increment]?
+                 "serial"
+               else
+                 options[:sql_type]? || translate_type(options[:type].as(Symbol))
+               end
         size = options[:size]? || default_type_size(options[:type]?)
         io << " " << type
         io << "(#{size})" if size
@@ -260,12 +290,14 @@ module Jennifer
       end
 
       def self.create_database
-        Process.run("PGPASSWORD=#{Config.password} createdb \"${@}\"", [Config.db, "-O", Config.user, "-h", Config.host, "-U", Config.user], shell: true).inspect
+        opts = [Config.db, "-O", Config.user, "-h", Config.host, "-U", Config.user]
+        Process.run("PGPASSWORD=#{Config.password} createdb \"${@}\"", opts, shell: true).inspect
       end
 
       def self.drop_database
         io = IO::Memory.new
-        s = Process.run("PGPASSWORD=#{Config.password} dropdb \"${@}\"", [Config.db, "-h", Config.host, "-U", Config.user], shell: true, output: io, error: io)
+        opts = [Config.db, "-h", Config.host, "-U", Config.user]
+        s = Process.run("PGPASSWORD=#{Config.password} dropdb \"${@}\"", opts, shell: true, output: io, error: io)
         if s.exit_code != 0
           raise io.to_s
         end
@@ -273,20 +305,21 @@ module Jennifer
 
       def self.generate_schema
         io = IO::Memory.new
-        s = Process.run("PGPASSWORD=#{Config.password} pg_dump \"${@}\"", ["-U", Config.user, "-d", Config.db, "-h", Config.host, "-s"], shell: true, output: io)
+        opts = ["-U", Config.user, "-d", Config.db, "-h", Config.host, "-s"]
+        s = Process.run("PGPASSWORD=#{Config.password} pg_dump \"${@}\"", opts, shell: true, output: io)
         File.write(Config.structure_path, io.to_s)
       end
 
       def self.load_schema
         io = IO::Memory.new
-        s = Process.run("PGPASSWORD=#{Config.password} psql \"${@}\"", ["-U", Config.user, "-d", Config.db, "-h", Config.host, "-a", "-f", Config.structure_path], shell: true, output: io)
+        opts = ["-U", Config.user, "-d", Config.db, "-h", Config.host, "-a", "-f", Config.structure_path]
+        s = Process.run("PGPASSWORD=#{Config.password} psql \"${@}\"", opts, shell: true, output: io)
         raise "Cant load schema: exit code #{s.exit_code}" if s.exit_code != 0
       end
     end
   end
 
   macro after_load_hook
-    require "./jennifer/adapter/postgres/condition"
     require "./jennifer/adapter/postgres/criteria"
     require "./jennifer/adapter/postgres/numeric"
     require "./jennifer/adapter/postgres/migration/base"

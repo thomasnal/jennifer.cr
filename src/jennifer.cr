@@ -1,21 +1,23 @@
-require "json"
 require "inflector"
 require "inflector/string"
 require "accord"
+require "ifrit/converter"
 
 require "./jennifer/exceptions"
 require "./jennifer/adapter"
+require "./jennifer/adapter/record"
+require "./jennifer/adapter/sql_generator"
 require "./jennifer/config"
-require "./jennifer/support"
 require "./jennifer/version"
 
 require "./jennifer/query_builder/*"
 require "./jennifer/adapter/base"
-require "./jennifer/migration/table_builder/*"
-require "./jennifer/migration/*"
 require "./jennifer/relation/base"
 require "./jennifer/relation/*"
 require "./jennifer/model/*"
+
+require "./jennifer/migration/table_builder/*"
+require "./jennifer/migration/*"
 
 module Jennifer
   alias Query = QueryBuilder::Query
@@ -41,7 +43,7 @@ module Jennifer
       raise "stubed relation"
     end
 
-    {% for method in [:table_name, :model_class, :type, :set_callback, :condition_clause, :join_query] %}
+    {% for method in %i(table_name model_class type set_callback condition_clause foreign_field primary_field join_query) %}
       def {{method.id}}
         raise "stubed relation"
       end

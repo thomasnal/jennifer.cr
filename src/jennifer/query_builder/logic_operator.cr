@@ -30,7 +30,7 @@ module Jennifer
       abstract def operator
 
       def to_s
-        to_sql
+        as_sql
       end
 
       def alias_tables(aliases)
@@ -45,12 +45,16 @@ module Jennifer
         @parts.each(&.change_table(old_name, new_name))
       end
 
-      def to_sql
-        "(" + @parts.map(&.to_sql).join(" #{operator} ") + ")"
+      def as_sql
+        "(" + @parts.map(&.as_sql).join(" #{operator} ") + ")"
       end
 
       def sql_args : Array(DB::Any)
         @parts.flat_map(&.sql_args)
+      end
+
+      def sql_args_count
+        @parts.reduce(0) { |sum, e| sum += e.sql_args_count }
       end
 
       def ==(other : LogicOperator)
